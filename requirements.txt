@@ -1,0 +1,39 @@
+# ============================================================
+# PLAsTiCC Pipeline — Python dependencies
+# Tested on Python 3.10+, CUDA 11.8 / 12.1
+# ============================================================
+
+# Core numerical / data
+numpy>=1.24,<2.0
+pandas>=2.0
+scipy>=1.11
+
+# Machine learning
+scikit-learn>=1.3
+xgboost>=2.0
+
+# Deep learning
+torch>=2.1
+torchvision>=0.16          # pulled in by some torch utilities
+
+# Pretrained / foundation models
+transformers>=4.40          # Chronos T5 encoder fallback
+huggingface_hub>=0.22       # model downloading
+
+# Astromer (Model 3) — installs as module 'ASTROMER' (all caps)
+astromer>=0.1.8             # pip install astromer
+tensorboard>=2.14           # required by ASTROMER internals
+
+# Moirai (Model 4) — install uni2ts separately if desired:
+#   pip install git+https://github.com/SalesforceAIResearch/uni2ts.git
+# uni2ts                    # uncomment if available
+
+# Visualisation
+matplotlib>=3.8
+
+# Utilities
+tqdm>=4.66
+kaggle>=1.6                 # Kaggle CLI for dataset download
+
+# Jupyter / Colab integration (optional but recommended)
+ipywidgets>=8.0
