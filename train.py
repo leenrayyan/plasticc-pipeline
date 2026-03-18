@@ -162,11 +162,18 @@ def train_model(
     model = model.to(device)
 
     # ---- Class-weighted loss -----------------------------------------------
+    # Rare classes (kilonovae, TDEs) have very few examples.
+    # Without weights the model would just predict SNIa for everything.
+    # Weight_c = n_total / (n_classes * count_c) — rarer class = higher penalty.
     print(f"[train] Computing class weights for {model_name} …")
     class_weights = _compute_class_weights(train_loader, n_classes).to(device)
     criterion     = nn.CrossEntropyLoss(weight=class_weights)
 
     # ---- Optimiser + scheduler ---------------------------------------------
+    # Adam with cosine LR schedule: learning rate warms up linearly for a few
+    # epochs, then decays smoothly to near-zero. This avoids instability early
+    # in training and helps convergence later.
+    # filter(requires_grad) skips frozen encoder weights (Astromer / Moirai).
     optimiser = Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr = config.LEARNING_RATE,
@@ -213,7 +220,9 @@ def train_model(
             f"({elapsed:.1f}s)"
         )
 
-        # Best checkpoint
+        # Best checkpoint — save only when val_loss improves.
+        # If it doesn't improve for EARLY_STOPPING_PATIENCE epochs in a row,
+        # stop training and reload the best weights saved so far.
         if val_loss < best_val_loss:
             best_val_loss  = val_loss
             patience_count = 0

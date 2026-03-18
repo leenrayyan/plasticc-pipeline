@@ -131,6 +131,9 @@ def _evaluate_one(
     test_loader  = DataLoader(test_ds,  batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
 
     # ---- XGBoost branch ----------------------------------------------------
+    # XGBoost doesn't use raw sequences — it needs a flat feature vector per
+    # object (mean flux, slope, skewness, etc.) computed in features.py.
+    # No MC Dropout here; variance is set to zero (no uncertainty estimate).
     if model_name in _XGB_MODELS:
         if verbose:
             print(f"[evaluate] XGBoost | fraction={fraction}")
@@ -156,7 +159,10 @@ def _evaluate_one(
         variance   = np.zeros_like(probs)
         ent        = uncertainty._entropy(probs)
 
-    # ---- Deep-learning branch ----------------------------------------------
+    # ---- Deep-learning branch (Transformer / Astromer / Moirai) -----------
+    # If a checkpoint already exists for this model+fraction combo, skip
+    # training and load it directly (useful for re-running evaluation).
+    # MC Dropout: run N=50 forward passes with dropout ON to get uncertainty.
     else:
         ckpt_path = os.path.join(config.CHECKPOINT_DIR, f"{tag}.pt")
         model     = build_model(model_name, n_classes, device)
@@ -186,6 +192,12 @@ def _evaluate_one(
         labels_arr = result["labels"]
 
     # ---- Metrics -----------------------------------------------------------
+    # macro_f1   : average F1 across all 14 classes equally — penalises
+    #              models that ignore rare classes.
+    # pr_auc     : area under precision-recall curve — better than ROC for
+    #              imbalanced datasets.
+    # ece        : calibration error — how well confidence matches accuracy.
+    # topk_recall: of all true rare events, how many did we catch in top-K?
     preds = probs.argmax(axis=1)
 
     macro_f1 = float(f1_score(labels_arr, preds, average="macro", zero_division=0))
