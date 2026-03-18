@@ -89,7 +89,8 @@ def handle_missing(lc: pd.DataFrame) -> pd.DataFrame:
 
     lc["flux"]     = lc["flux"].fillna(0.0)
     lc["flux_err"] = lc["flux_err"].fillna(0.0)
-    lc["detected"] = lc["detected"].fillna(0).astype(int)
+    detected_col = "detected_bool" if "detected_bool" in lc.columns else "detected"
+    lc[detected_col] = lc[detected_col].fillna(0).astype(int)
     return lc
 
 

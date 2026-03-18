@@ -71,7 +71,8 @@ def extract_features(grp: pd.DataFrame) -> np.ndarray:
     flux     = grp["flux"].values.astype(float)
     flux_err = grp["flux_err"].values.astype(float)
     mjd      = grp["mjd"].values.astype(float)
-    detected = grp["detected"].values.astype(int)
+    detected_col = "detected_bool" if "detected_bool" in grp.columns else "detected"
+    detected = grp[detected_col].values.astype(int)
 
     # ---- Global statistics -------------------------------------------------
     mean_flux  = float(np.mean(flux))
