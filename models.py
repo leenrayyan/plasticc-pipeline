@@ -54,11 +54,11 @@ class XGBoostClassifier:
                 "xgboost is required for Model 1. Install it with: pip install xgboost"
             ) from exc
 
-        params = {**config.XGB_PARAMS, **kwargs}
-        params["num_class"] = n_classes          # for multi-class softmax
-        params["objective"] = "multi:softmax"    # overridden below for proba
-        self.model = XGBClassifier(**{k: v for k, v in params.items()
-                                      if k != "objective"},
+        # Remove objective/num_class from params to avoid duplicate keyword errors,
+        # then pass them explicitly with the correct values.
+        params = {k: v for k, v in {**config.XGB_PARAMS, **kwargs}.items()
+                  if k not in ("objective", "num_class")}
+        self.model = XGBClassifier(**params,
                                    objective="multi:softprob",
                                    num_class=n_classes)
         self.n_classes = n_classes
