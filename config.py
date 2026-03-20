@@ -87,10 +87,10 @@ MAX_WAVELENGTH   = 10_000.0   # denominator in sinusoidal time encoding
 # Training hyperparameters (Models 2, 3, 4)
 # ---------------------------------------------------------------------------
 BATCH_SIZE              = 64
-LEARNING_RATE           = 3e-5
+LEARNING_RATE           = 1e-4
 MAX_EPOCHS              = 50
 EARLY_STOPPING_PATIENCE = 5
-LR_WARMUP_EPOCHS        = 5    # linear warm-up epochs before cosine decay
+LR_WARMUP_EPOCHS        = 3    # linear warm-up epochs before cosine decay
 
 # ---------------------------------------------------------------------------
 # MC Dropout inference
