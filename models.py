@@ -343,7 +343,7 @@ class AstroClassifier(nn.Module):
             "mask_in": mask_in,
         }
 
-        emb = self.backbone(inp)  # (B, L, d_model) or (B, d_model)
+        emb = self.backbone.encode(inp) # (B, L, d_model) or (B, d_model)
 
         # Convert to torch tensor
         if not isinstance(emb, torch.Tensor):
