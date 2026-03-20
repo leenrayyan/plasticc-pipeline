@@ -322,39 +322,29 @@ class AstroClassifier(nn.Module):
         self.head = AstroClassifierHead(embed_dim, n_classes)
 
     def _encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Run Astromer backbone and return pooled embedding."""
-        import numpy as np
+      import numpy as np
+      import tensorflow as tf
 
-        # Astromer expects numpy inputs
-        time = x[:, :, 2].cpu().numpy()   # time_delta
-        flux = x[:, :, 0].cpu().numpy()   # flux
-        mask_np = mask.cpu().numpy()       # True = padded
+      time = x[:, :, 2].cpu().numpy().astype(np.float32)
+      flux = x[:, :, 0].cpu().numpy().astype(np.float32)
+      mask_np = mask.cpu().numpy().astype(np.float32)
 
-        B, L = time.shape
+      B, L = time.shape
 
-        # Astromer1 expects shape (B, L, 1) for flux and time, (B, L, 1) for mask
-        time_in = time.reshape(B, L, 1).astype(np.float32)
-        flux_in = flux.reshape(B, L, 1).astype(np.float32)
-        mask_in = (~mask_np).reshape(B, L, 1).astype(np.float32)  # 1=valid, 0=padded
+      batch = {
+          "times"  : tf.constant(time.reshape(B, L, 1)),
+          "input"  : tf.constant(flux.reshape(B, L, 1)),
+          "mask_in": tf.constant((1 - mask_np).reshape(B, L, 1)),
+    }
 
-        inp = {
-            "times"  : time_in,
-            "input"  : flux_in,
-            "mask_in": mask_in,
-        }
+    encoder = self.backbone.model.get_layer("encoder")
+    emb = encoder(batch).numpy()  # (B, L, d_model)
 
-        emb = self.backbone.encode(inp) # (B, L, d_model) or (B, d_model)
-
-        # Convert to torch tensor
-        if not isinstance(emb, torch.Tensor):
-            emb = torch.tensor(np.array(emb), dtype=torch.float32, device=x.device)
-
-        # Pool over sequence dimension if needed
-        if emb.dim() == 3:
-            valid = torch.tensor(~mask_np, dtype=torch.float32, device=x.device).unsqueeze(-1)
-            emb   = (emb * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-
-        return emb  # (B, embed_dim)
+    # Mean pool over valid timesteps
+    valid = (1 - mask_np).reshape(B, L, 1)
+    emb   = (emb * valid).sum(axis=1) / valid.sum(axis=1).clip(min=1)
+    emb   = torch.tensor(emb, dtype=torch.float32, device=x.device)
+    return emb  # (B, d_model)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         emb    = self._encode(x, mask)
