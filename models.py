@@ -21,8 +21,11 @@ Model 4  MoiraiClassifier     Moirai-small (Salesforce) or Chronos-small
 
 Factory  build_model(name, n_classes, …) → model instance.
 """
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
 import math
+import os
 import warnings
 from typing import Optional
 
@@ -119,12 +122,6 @@ class SinusoidalTimeEncoding(nn.Module):
         PE(t, 2i+1) = cos( t / max_wavelength^(2i / d_model) )
 
     This preserves the irregular-cadence structure of the light curves.
-
-    Parameters
-    ----------
-    d_model        : Transformer model dimension.
-    max_wavelength : Denominator scale (analogous to 10000 in the original
-                     Attention Is All You Need paper).
     """
 
     def __init__(
@@ -136,27 +133,14 @@ class SinusoidalTimeEncoding(nn.Module):
         self.d_model        = d_model
         self.max_wavelength = max_wavelength
 
-        # Pre-compute dimension exponents (fixed, not learnable)
         half  = d_model // 2
         expos = torch.arange(half, dtype=torch.float32) * 2.0 / d_model
-        self.register_buffer("divisor", max_wavelength ** expos)  # (d_model/2,)
+        self.register_buffer("divisor", max_wavelength ** expos)
 
     def forward(self, time_deltas: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        time_deltas : Tensor of shape ``(batch, seq_len)`` — days since first obs.
-
-        Returns
-        -------
-        Tensor of shape ``(batch, seq_len, d_model)``.
-        """
-        # time_deltas: (B, L) → (B, L, 1)
-        t = time_deltas.unsqueeze(-1)                    # (B, L, 1)
-        angles = t / self.divisor                         # (B, L, d_model/2)
-        enc    = torch.cat([angles.sin(), angles.cos()], dim=-1)  # (B, L, d_model)
-
-        # If d_model is odd, trim the last column
+        t      = time_deltas.unsqueeze(-1)
+        angles = t / self.divisor
+        enc    = torch.cat([angles.sin(), angles.cos()], dim=-1)
         return enc[..., : self.d_model]
 
 
@@ -172,19 +156,7 @@ class TransformerClassifier(nn.Module):
     4. N encoder layers (multi-head self-attention + FFN).
     5. Extract CLS output → Dropout → Linear(d_model, n_classes).
 
-    MC Dropout: dropout layers remain **active during inference** when the
-    model is in ``train()`` mode.  The ``mc_mode()`` context manager
-    (defined below) enables this without affecting batch-norm layers.
-
-    Parameters
-    ----------
-    n_classes      : Number of output classes.
-    input_dim      : Feature dimension per time step (default: config.INPUT_DIM).
-    d_model        : Transformer hidden dimension.
-    n_heads        : Number of attention heads.
-    n_layers       : Number of Transformer encoder layers.
-    dim_feedforward: FFN hidden dimension.
-    dropout        : Dropout probability (applied in attention + head).
+    MC Dropout: dropout layers remain active during inference.
     """
 
     def __init__(
@@ -200,95 +172,63 @@ class TransformerClassifier(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # Input projection
         self.input_proj = nn.Linear(input_dim, d_model)
 
-        # Layer norm applied after input projection + time encoding
-        # Stabilises activations before the transformer encoder,
-        # preventing gradient explosion during LR warmup.
+        # Layer norm stabilises activations before encoder, preventing NaN during LR warmup
         self.input_norm = nn.LayerNorm(d_model)
 
-        # Learnable CLS token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-        # Time encoding (uses the time_delta channel, index 2)
         self.time_enc = SinusoidalTimeEncoding(d_model)
 
-        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model         = d_model,
             nhead           = n_heads,
             dim_feedforward = dim_feedforward,
             dropout         = dropout,
             activation      = "relu",
-            batch_first     = True,   # (batch, seq, feat)
+            batch_first     = True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # Classification head
         self.head_dropout = nn.Dropout(p=dropout)
         self.classifier   = nn.Linear(d_model, n_classes)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Kaiming / Xavier initialisation for linear layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(
-        self,
-        x    : torch.Tensor,
-        mask : torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x    : Tensor ``(batch, seq_len, INPUT_DIM)``
-        mask : Tensor ``(batch, seq_len)`` bool — True for padded positions.
-
-        Returns
-        -------
-        logits : Tensor ``(batch, n_classes)``
-        """
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         B, L, _ = x.shape
 
-        # Sanitize: replace any NaN/Inf values (can appear in padded positions)
-        # before any computation to prevent gradient explosion.
+        # Sanitize inputs — NaN/Inf can appear in padded positions
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Project to d_model
-        out = self.input_proj(x)                              # (B, L, d_model)
+        out = self.input_proj(x)
 
-        # Add time-based positional encoding (time_delta is feature index 2).
-        # Clamp time deltas to a safe range to prevent sinusoidal overflow.
-        time_deltas = x[:, :, 2].clamp(min=0.0, max=1000.0)  # (B, L)
-        out = out + self.time_enc(time_deltas)                # (B, L, d_model)
+        # Clamp time deltas to prevent sinusoidal overflow
+        time_deltas = x[:, :, 2].clamp(min=0.0, max=1000.0)
+        out = out + self.time_enc(time_deltas)
 
-        # Normalise before feeding into the transformer encoder.
-        # This is the key fix for NaN loss after epoch 1 — without it,
-        # the LR warmup causes activations to explode in the attention layers.
-        out = self.input_norm(out)                            # (B, L, d_model)
+        # Normalise before encoder to prevent gradient explosion
+        out = self.input_norm(out)
 
-        # Prepend CLS token
-        cls  = self.cls_token.expand(B, -1, -1)              # (B, 1, d_model)
-        out  = torch.cat([cls, out], dim=1)                   # (B, 1+L, d_model)
+        cls       = self.cls_token.expand(B, -1, -1)
+        out       = torch.cat([cls, out], dim=1)
 
-        # Extend mask: CLS is never masked
-        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=mask.device)
-        full_mask = torch.cat([cls_mask, mask], dim=1)        # (B, 1+L)
+        cls_mask  = torch.zeros(B, 1, dtype=torch.bool, device=mask.device)
+        full_mask = torch.cat([cls_mask, mask], dim=1)
 
-        # Transformer encoder
-        out = self.encoder(out, src_key_padding_mask=full_mask)  # (B, 1+L, d_model)
-
-        # CLS token output → classification head
-        cls_out = out[:, 0, :]                                # (B, d_model)
+        out     = self.encoder(out, src_key_padding_mask=full_mask)
+        cls_out = out[:, 0, :]
         cls_out = self.head_dropout(cls_out)
-        logits  = self.classifier(cls_out)                    # (B, n_classes)
+        logits  = self.classifier(cls_out)
         return logits
 
 
@@ -302,12 +242,8 @@ def _try_load_astromer():
 
     Priority
     --------
-    1. Astromer2 (from GitHub / HuggingFace — ``astromer2`` package).
-    2. Astromer1 (``pip install astromer``).
-
-    Returns
-    -------
-    (backbone, embed_dim, loader_name)  or raises ImportError.
+    1. Astromer2 (astromer2 package).
+    2. Astromer1 (pip install astromer).
     """
     # ---- Try Astromer2 -------------------------------------------------------
     try:
@@ -319,31 +255,34 @@ def _try_load_astromer():
     except Exception:
         pass
 
-    # ---- Try Astromer1 (pip install astromer — installs as module 'ASTROMER') ----
+    # ---- Try Astromer1 -------------------------------------------------------
     try:
         from ASTROMER.models import SingleBandEncoder as Encoder1
         backbone  = Encoder1()
-        backbone.load_weights(config.ASTROMER_WEIGHTS)
-        embed_dim = getattr(backbone, "output_dim", 256)
+
+        # Only load weights if the path exists — skip if not available
+        if os.path.exists(config.ASTROMER_WEIGHTS):
+            backbone.load_weights(config.ASTROMER_WEIGHTS)
+            print("[models] Loaded Astromer1 weights from", config.ASTROMER_WEIGHTS)
+        else:
+            print("[models] Astromer1 loaded with random init (no pretrained weights path found).")
+
+        embed_dim = getattr(backbone, "d_model", getattr(backbone, "output_dim", 200))
         print("[models] Loaded Astromer1 backbone (ASTROMER package).")
         return backbone, embed_dim, "astromer1"
-    except Exception:
+    except Exception as e:
         pass
 
     raise ImportError(
         "Neither Astromer2 nor Astromer1 could be imported.\n"
         "Install with:  python -m pip install astromer tensorboard\n"
+        "Also set os.environ['TF_USE_LEGACY_KERAS'] = '1' before importing.\n"
         "Astromer2 (if available): pip install astromer2"
     )
 
 
 class AstroClassifierHead(nn.Module):
-    """
-    Classification head appended to a frozen Astromer encoder.
-
-    Architecture: Linear(embed_dim, 128) → ReLU → Dropout(0.1)
-                  → Linear(128, n_classes)
-    """
+    """Classification head: Linear(embed_dim, 128) → ReLU → Dropout → Linear(128, n_classes)"""
 
     def __init__(self, embed_dim: int, n_classes: int, dropout: float = config.DROPOUT) -> None:
         super().__init__()
@@ -355,7 +294,6 @@ class AstroClassifierHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, embed_dim)  →  logits: (batch, n_classes)"""
         return self.net(x)
 
 
@@ -365,64 +303,61 @@ class AstroClassifier(nn.Module):
 
     The encoder weights are frozen; only the head is trained.
     MC Dropout is applied inside the classification head.
-
-    Parameters
-    ----------
-    n_classes : Number of target classes.
     """
 
     def __init__(self, n_classes: int) -> None:
         super().__init__()
         backbone, embed_dim, self._loader = _try_load_astromer()
 
-        # Freeze encoder
         self.backbone  = backbone
         self.embed_dim = embed_dim
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+
+        # Freeze encoder — only train the classification head
+        try:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        except Exception:
+            pass  # TF/Keras models don't use .parameters()
 
         self.head = AstroClassifierHead(embed_dim, n_classes)
 
     def _encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Run the Astromer backbone and return a pooled embedding.
+        """Run Astromer backbone and return pooled embedding."""
+        import numpy as np
 
-        Astromer1 / 2 differ slightly in their forward API; we handle both.
-        ``x`` has shape ``(batch, seq_len, INPUT_DIM)``.
-        """
-        # Astromer expects (time, flux, flux_err) — channels 2, 0, 1
-        time   = x[:, :, 2]   # time_delta
-        flux   = x[:, :, 0]   # flux
-        ferr   = x[:, :, 1]   # flux_err
+        # Astromer expects numpy inputs
+        time = x[:, :, 2].cpu().numpy()   # time_delta
+        flux = x[:, :, 0].cpu().numpy()   # flux
+        mask_np = mask.cpu().numpy()       # True = padded
 
-        try:
-            # Astromer2-style API
-            emb = self.backbone(time=time, flux=flux, flux_err=ferr, mask=mask)
-        except TypeError:
-            # Astromer1-style API: expects a dict
-            inp = {"times": time, "input": flux, "mask_in": ~mask}
-            emb = self.backbone(inp)
+        B, L = time.shape
+
+        # Astromer1 expects shape (B, L, 1) for flux and time, (B, L, 1) for mask
+        time_in = time.reshape(B, L, 1).astype(np.float32)
+        flux_in = flux.reshape(B, L, 1).astype(np.float32)
+        mask_in = (~mask_np).reshape(B, L, 1).astype(np.float32)  # 1=valid, 0=padded
+
+        inp = {
+            "times"  : time_in,
+            "input"  : flux_in,
+            "mask_in": mask_in,
+        }
+
+        emb = self.backbone(inp)  # (B, L, d_model) or (B, d_model)
+
+        # Convert to torch tensor
+        if not isinstance(emb, torch.Tensor):
+            emb = torch.tensor(np.array(emb), dtype=torch.float32, device=x.device)
 
         # Pool over sequence dimension if needed
         if emb.dim() == 3:
-            # Mask out padding before mean-pooling
-            valid = (~mask).float().unsqueeze(-1)          # (B, L, 1)
+            valid = torch.tensor(~mask_np, dtype=torch.float32, device=x.device).unsqueeze(-1)
             emb   = (emb * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-        return emb   # (batch, embed_dim)
+
+        return emb  # (B, embed_dim)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x    : Tensor ``(batch, seq_len, INPUT_DIM)``
-        mask : Tensor ``(batch, seq_len)`` bool — True for padded positions.
-
-        Returns
-        -------
-        logits : Tensor ``(batch, n_classes)``
-        """
-        with torch.no_grad():
-            emb = self._encode(x, mask)
+        emb    = self._encode(x, mask)
         logits = self.head(emb)
         return logits
 
@@ -433,22 +368,15 @@ class AstroClassifier(nn.Module):
 
 def _try_load_moirai(device: torch.device):
     """
-    Attempt to load a Moirai-small or Chronos-small backbone.
+    Attempt to load Moirai-small or Chronos-small backbone.
 
-    Priority
-    --------
-    1. Moirai-small  (Salesforce/moirai-1.0-R-small via uni2ts).
-    2. Chronos-small (amazon/chronos-t5-small via transformers T5EncoderModel).
-
-    Returns
-    -------
-    (backbone, embed_dim, loader_name)  or raises ImportError.
+    Priority: Moirai → Chronos.
     """
     # ---- Try Moirai ----------------------------------------------------------
     try:
         from uni2ts.model.moirai import MoiraiModule
-        backbone = MoiraiModule.from_pretrained(config.MOIRAI_MODEL_ID)
-        backbone = backbone.to(device)
+        backbone  = MoiraiModule.from_pretrained(config.MOIRAI_MODEL_ID)
+        backbone  = backbone.to(device)
         backbone.eval()
         embed_dim = backbone.config.d_model
         print(f"[models] Loaded Moirai backbone ({config.MOIRAI_MODEL_ID}).")
@@ -460,22 +388,21 @@ def _try_load_moirai(device: torch.device):
             stacklevel=2,
         )
 
-    # ---- Try Chronos via T5EncoderModel -------------------------------------
+    # ---- Try Chronos ---------------------------------------------------------
     try:
-        from transformers import T5EncoderModel, AutoTokenizer
+        from transformers import T5EncoderModel
         backbone  = T5EncoderModel.from_pretrained(config.CHRONOS_MODEL_ID)
         backbone  = backbone.to(device)
         backbone.eval()
         embed_dim = backbone.config.d_model
         print(f"[models] Loaded Chronos T5 encoder ({config.CHRONOS_MODEL_ID}).")
         return backbone, embed_dim, "chronos"
-    except Exception as e:
+    except Exception:
         pass
 
     raise ImportError(
         "Neither Moirai nor Chronos could be imported.\n"
         "Install Moirai:  pip install uni2ts\n"
-        "Install Chronos: pip install git+https://github.com/amazon-science/chronos-forecasting.git\n"
         "Or install transformers>=4.40: pip install transformers"
     )
 
@@ -483,14 +410,7 @@ def _try_load_moirai(device: torch.device):
 class MoiraiClassifier(nn.Module):
     """
     Moirai-small or Chronos-small encoder with a learnable classification head.
-
-    The foundation-model encoder is frozen; only the classification head is
-    trained.  MC Dropout is applied in the head.
-
-    Parameters
-    ----------
-    n_classes : Number of target classes.
-    device    : torch.device to load the backbone onto.
+    Encoder is frozen; only the head is trained. MC Dropout in the head.
     """
 
     def __init__(self, n_classes: int, device: Optional[torch.device] = None) -> None:
@@ -499,18 +419,15 @@ class MoiraiClassifier(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         backbone, embed_dim, self._loader = _try_load_moirai(device)
-        self.backbone  = backbone
-        self.embed_dim = embed_dim
-        self._device   = device
+        self.backbone      = backbone
+        self.embed_dim     = embed_dim
+        self._device       = device
 
-        # Freeze encoder
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # Lightweight input adapter: project INPUT_DIM → embed_dim
         self.input_adapter = nn.Linear(config.INPUT_DIM, embed_dim)
 
-        # Classification head with MC Dropout
         self.head = nn.Sequential(
             nn.Linear(embed_dim, 128),
             nn.ReLU(),
@@ -519,57 +436,36 @@ class MoiraiClassifier(nn.Module):
         )
 
     def _encode_moirai(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Encode with Moirai backbone using the flux channel."""
-        flux = x[:, :, 0].unsqueeze(-1)          # (B, L, 1)
-        obs_mask = ~mask                           # True = valid observation
+        flux     = x[:, :, 0].unsqueeze(-1)
+        obs_mask = ~mask
         try:
             out = self.backbone.encode(
                 past_values        = flux,
                 past_observed_mask = obs_mask.unsqueeze(-1),
             )
-            if hasattr(out, "last_hidden_state"):
-                hidden = out.last_hidden_state     # (B, L, d_model)
-            else:
-                hidden = out
+            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
         except Exception:
-            # Fallback: project and mean-pool
-            hidden = self.input_adapter(x)         # (B, L, embed_dim)
+            hidden = self.input_adapter(x)
 
-        # Mean-pool over valid timesteps
-        valid  = (~mask).float().unsqueeze(-1)     # (B, L, 1)
-        emb    = (hidden * valid).sum(1) / valid.sum(1).clamp(min=1)
-        return emb   # (B, embed_dim)
+        valid = (~mask).float().unsqueeze(-1)
+        emb   = (hidden * valid).sum(1) / valid.sum(1).clamp(min=1)
+        return emb
 
     def _encode_chronos(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Encode with Chronos T5 encoder by projecting features into embedding space."""
-        proj   = self.input_adapter(x)             # (B, L, embed_dim)
-        attn   = (~mask).long()                    # (B, L) attention mask
-        out    = self.backbone(
-            inputs_embeds   = proj,
-            attention_mask  = attn,
-        )
-        hidden = out.last_hidden_state             # (B, L, embed_dim)
+        proj   = self.input_adapter(x)
+        attn   = (~mask).long()
+        out    = self.backbone(inputs_embeds=proj, attention_mask=attn)
+        hidden = out.last_hidden_state
         valid  = (~mask).float().unsqueeze(-1)
         emb    = (hidden * valid).sum(1) / valid.sum(1).clamp(min=1)
-        return emb   # (B, embed_dim)
+        return emb
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x    : Tensor ``(batch, seq_len, INPUT_DIM)``
-        mask : Tensor ``(batch, seq_len)`` bool — True for padded positions.
-
-        Returns
-        -------
-        logits : Tensor ``(batch, n_classes)``
-        """
         with torch.no_grad():
             if self._loader == "moirai":
                 emb = self._encode_moirai(x, mask)
             else:
                 emb = self._encode_chronos(x, mask)
-
         logits = self.head(emb)
         return logits
 
@@ -588,14 +484,9 @@ def build_model(
 
     Parameters
     ----------
-    name      : One of ``"xgboost"``, ``"transformer"``, ``"astromer"``,
-                ``"moirai"``.
+    name      : One of 'xgboost', 'transformer', 'astromer', 'moirai'.
     n_classes : Number of output classes.
-    device    : torch.device (used by Moirai loader).  Auto-detected if None.
-
-    Returns
-    -------
-    Model instance (XGBoostClassifier or nn.Module subclass).
+    device    : torch.device. Auto-detected if None.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
