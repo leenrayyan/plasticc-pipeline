@@ -21,11 +21,11 @@ Model 4  MoiraiClassifier     Moirai-small (Salesforce) or Chronos-small
 
 Factory  build_model(name, n_classes, …) → model instance.
 """
+
 import os
-os.environ["TF_USE_LEGACY_KERAS"] = "1"
+os.environ["TF_USE_LEGACY_KERAS"] = "1"  # Must be set before any TF/Keras import
 
 import math
-import os
 import warnings
 from typing import Optional
 
@@ -322,29 +322,32 @@ class AstroClassifier(nn.Module):
         self.head = AstroClassifierHead(embed_dim, n_classes)
 
     def _encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-      import numpy as np
-      import tensorflow as tf
+        """Run Astromer encoder layer directly and return pooled embedding."""
+        import numpy as np
+        import tensorflow as tf
 
-      time = x[:, :, 2].cpu().numpy().astype(np.float32)
-      flux = x[:, :, 0].cpu().numpy().astype(np.float32)
-      mask_np = mask.cpu().numpy().astype(np.float32)
+        time    = x[:, :, 2].cpu().numpy().astype(np.float32)
+        flux    = x[:, :, 0].cpu().numpy().astype(np.float32)
+        mask_np = mask.cpu().numpy().astype(np.float32)  # 1=padded, 0=valid
 
-      B, L = time.shape
+        B, L = time.shape
 
-      batch = {
-          "times"  : tf.constant(time.reshape(B, L, 1)),
-          "input"  : tf.constant(flux.reshape(B, L, 1)),
-          "mask_in": tf.constant((1 - mask_np).reshape(B, L, 1)),
-    }
+        # Astromer encoder expects a dict with TF tensors
+        batch = {
+            "times"  : tf.constant(time.reshape(B, L, 1)),
+            "input"  : tf.constant(flux.reshape(B, L, 1)),
+            "mask_in": tf.constant((1 - mask_np).reshape(B, L, 1)),  # 1=valid
+        }
 
-    encoder = self.backbone.model.get_layer("encoder")
-    emb = encoder(batch).numpy()  # (B, L, d_model)
+        # Call the internal encoder layer directly
+        encoder = self.backbone.model.get_layer("encoder")
+        emb     = encoder(batch).numpy()  # (B, L, d_model)
 
-    # Mean pool over valid timesteps
-    valid = (1 - mask_np).reshape(B, L, 1)
-    emb   = (emb * valid).sum(axis=1) / valid.sum(axis=1).clip(min=1)
-    emb   = torch.tensor(emb, dtype=torch.float32, device=x.device)
-    return emb  # (B, d_model)
+        # Mean-pool over valid timesteps
+        valid = (1 - mask_np).reshape(B, L, 1)
+        emb   = (emb * valid).sum(axis=1) / valid.sum(axis=1).clip(min=1)
+        emb   = torch.tensor(emb, dtype=torch.float32, device=x.device)
+        return emb  # (B, d_model)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         emb    = self._encode(x, mask)
