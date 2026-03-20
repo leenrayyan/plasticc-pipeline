@@ -203,6 +203,11 @@ class TransformerClassifier(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(input_dim, d_model)
 
+        # Layer norm applied after input projection + time encoding
+        # Stabilises activations before the transformer encoder,
+        # preventing gradient explosion during LR warmup.
+        self.input_norm = nn.LayerNorm(d_model)
+
         # Learnable CLS token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
@@ -252,12 +257,22 @@ class TransformerClassifier(nn.Module):
         """
         B, L, _ = x.shape
 
+        # Sanitize: replace any NaN/Inf values (can appear in padded positions)
+        # before any computation to prevent gradient explosion.
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Project to d_model
         out = self.input_proj(x)                              # (B, L, d_model)
 
-        # Add time-based positional encoding (time_delta is feature index 2)
-        time_deltas = x[:, :, 2]                              # (B, L)
+        # Add time-based positional encoding (time_delta is feature index 2).
+        # Clamp time deltas to a safe range to prevent sinusoidal overflow.
+        time_deltas = x[:, :, 2].clamp(min=0.0, max=1000.0)  # (B, L)
         out = out + self.time_enc(time_deltas)                # (B, L, d_model)
+
+        # Normalise before feeding into the transformer encoder.
+        # This is the key fix for NaN loss after epoch 1 — without it,
+        # the LR warmup causes activations to explode in the attention layers.
+        out = self.input_norm(out)                            # (B, L, d_model)
 
         # Prepend CLS token
         cls  = self.cls_token.expand(B, -1, -1)              # (B, 1, d_model)
@@ -472,15 +487,6 @@ class MoiraiClassifier(nn.Module):
     The foundation-model encoder is frozen; only the classification head is
     trained.  MC Dropout is applied in the head.
 
-    Notes
-    -----
-    * Moirai expects univariate time series; we feed the mean of all passbands
-      as the primary channel and include the other features as covariates.
-    * Chronos (T5 encoder) operates on tokenised sequences; we project our
-      continuous feature vectors through an embedding table before encoding.
-    * If either backbone is too large for the available GPU memory, reduce
-      ``MAX_SEQ_LEN`` in config.py or switch to CPU.
-
     Parameters
     ----------
     n_classes : Number of target classes.
@@ -536,9 +542,7 @@ class MoiraiClassifier(nn.Module):
 
     def _encode_chronos(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Encode with Chronos T5 encoder by projecting features into embedding space."""
-        # Project continuous features to embedding dimension
         proj   = self.input_adapter(x)             # (B, L, embed_dim)
-        # T5EncoderModel.forward expects (B, L, embed_dim) as inputs_embeds
         attn   = (~mask).long()                    # (B, L) attention mask
         out    = self.backbone(
             inputs_embeds   = proj,
