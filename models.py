@@ -260,12 +260,9 @@ def _try_load_astromer():
         from ASTROMER.models import SingleBandEncoder as Encoder1
         backbone  = Encoder1()
 
-        # Only load weights if the path exists — skip if not available
-        if os.path.exists(config.ASTROMER_WEIGHTS):
-            backbone.load_weights(config.ASTROMER_WEIGHTS)
-            print("[models] Loaded Astromer1 weights from", config.ASTROMER_WEIGHTS)
-        else:
-            print("[models] Astromer1 loaded with random init (no pretrained weights path found).")
+        # Load pretrained weights from MACHO survey (downloads automatically if not cached)
+        backbone.from_pretraining('macho')
+        print("[models] Loaded Astromer1 pretrained weights (MACHO survey).")
 
         embed_dim = getattr(backbone, "d_model", getattr(backbone, "output_dim", 200))
         print("[models] Loaded Astromer1 backbone (ASTROMER package).")
