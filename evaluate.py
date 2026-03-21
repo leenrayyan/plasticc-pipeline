@@ -1,12 +1,12 @@
 """
 evaluate.py — Full evaluation of all four models across truncation fractions.
 
-For each model × truncation fraction the following metrics are computed:
+For each model x truncation fraction the following metrics are computed:
     - Macro F1
     - PR-AUC (macro OvR)
     - Per-class recall
     - ECE (Expected Calibration Error)
-    - Top-K rare-class recall at K ∈ {50, 100, 200}
+    - Top-K rare-class recall at K in {50, 100, 200}
 
 All results are collected into a single pandas DataFrame and all figures
 (reliability diagrams, Top-K curves, accuracy vs truncation) are generated.
@@ -53,12 +53,10 @@ from torch.utils.data import DataLoader
 # Constants
 # ---------------------------------------------------------------------------
 
-# Models that use hand-crafted features (XGBoost only)
 _XGB_MODELS = {"xgboost"}
-# Models that use sequence DataLoaders
 _DL_MODELS  = {"transformer", "astromer", "moirai"}
 
-TOPK_EVAL   = [50, 100, 200]   # K values for per-row recall columns
+TOPK_EVAL   = [50, 100, 200]
 
 
 # ---------------------------------------------------------------------------
@@ -74,30 +72,16 @@ def _evaluate_one(
     verbose      : bool = True,
 ) -> Dict:
     """
-    Train (or load) *model_name* at *fraction*, run MC-Dropout inference,
+    Train (or load) model_name at fraction, run MC-Dropout inference,
     and return a dict of metrics.
-
-    Parameters
-    ----------
-    model_name : One of ``"xgboost"``, ``"transformer"``, ``"astromer"``,
-                 ``"moirai"``.
-    fraction   : Observation fraction in {0.1, 0.3, 0.5, 1.0}.
-    label_map  : Raw PLAsTiCC target → class index.
-    classes    : Sorted list of raw PLAsTiCC targets.
-    device     : Compute device.
-    verbose    : Print progress messages.
-
-    Returns
-    -------
-    dict with metric keys (scalars and small arrays).
     """
     n_classes = len(classes)
     tag       = f"{model_name}_f{fraction}"
 
-    # ---- Load raw data (re-used across models at same fraction) -----------
+    # ---- Load raw data ----------------------------------------------------
     lc, meta = load_raw_data()
     lc       = handle_missing(lc)
-    lc_raw   = lc.copy()               # keep un-normalised for XGBoost features
+    lc_raw   = lc.copy()
     lc       = normalize_flux(lc)
     lc       = truncate_observations(lc, fraction)
     lc_raw   = truncate_observations(lc_raw, fraction)
@@ -117,8 +101,7 @@ def _evaluate_one(
         random_state=config.SEED, stratify=strat_labels,
     )
 
-    # ---- Build DataLoaders -------------------------------------------------
-    from torch.utils.data import DataLoader
+    # ---- Build DataLoaders ------------------------------------------------
     train_ds = PLAsTiCCDataset(
         {o: sequences[o] for o in train_ids},
         {o: labels_map[o] for o in train_ids},
@@ -130,16 +113,12 @@ def _evaluate_one(
     train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True,  num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # ---- XGBoost branch ----------------------------------------------------
-    # XGBoost doesn't use raw sequences — it needs a flat feature vector per
-    # object (mean flux, slope, skewness, etc.) computed in features.py.
-    # No MC Dropout here; variance is set to zero (no uncertainty estimate).
+    # ---- XGBoost branch ---------------------------------------------------
     if model_name in _XGB_MODELS:
         if verbose:
             print(f"[evaluate] XGBoost | fraction={fraction}")
 
         X, y, obj_arr = feat_module.build_feature_matrix(lc_raw, meta, label_map)
-        # Align train / test splits
         obj_set_train = set(train_ids)
         obj_set_test  = set(test_ids)
         obj_arr_int   = obj_arr.astype(int)
@@ -159,10 +138,7 @@ def _evaluate_one(
         variance   = np.zeros_like(probs)
         ent        = uncertainty._entropy(probs)
 
-    # ---- Deep-learning branch (Transformer / Astromer / Moirai) -----------
-    # If a checkpoint already exists for this model+fraction combo, skip
-    # training and load it directly (useful for re-running evaluation).
-    # MC Dropout: run N=50 forward passes with dropout ON to get uncertainty.
+    # ---- Deep-learning branch ---------------------------------------------
     else:
         ckpt_path = os.path.join(config.CHECKPOINT_DIR, f"{tag}.pt")
         model     = build_model(model_name, n_classes, device)
@@ -174,7 +150,6 @@ def _evaluate_one(
         else:
             if verbose:
                 print(f"[evaluate] Training {model_name} | fraction={fraction}")
-            # Use test_loader as validation during training
             model, history = train_model(
                 model, train_loader, test_loader,
                 model_name=tag, n_classes=n_classes, device=device,
@@ -182,7 +157,6 @@ def _evaluate_one(
             save_history(history, tag)
             plot_training_curves(history, tag)
 
-        # MC Dropout inference
         if verbose:
             print(f"[evaluate] MC Dropout inference ({config.MC_SAMPLES} passes) …")
         result     = uncertainty.mc_predict(model, test_loader, device=device)
@@ -191,19 +165,11 @@ def _evaluate_one(
         ent        = result["entropy"]
         labels_arr = result["labels"]
 
-    # ---- Metrics -----------------------------------------------------------
-    # macro_f1   : average F1 across all 14 classes equally — penalises
-    #              models that ignore rare classes.
-    # pr_auc     : area under precision-recall curve — better than ROC for
-    #              imbalanced datasets.
-    # ece        : calibration error — how well confidence matches accuracy.
-    # topk_recall: of all true rare events, how many did we catch in top-K?
+    # ---- Metrics ----------------------------------------------------------
     preds = probs.argmax(axis=1)
 
     macro_f1 = float(f1_score(labels_arr, preds, average="macro", zero_division=0))
 
-    # PR-AUC (macro one-vs-rest)
-    classes_present = sorted(np.unique(labels_arr).tolist())
     y_bin = label_binarize(labels_arr, classes=list(range(n_classes)))
     try:
         prauc = float(average_precision_score(y_bin, probs, average="macro"))
@@ -217,17 +183,23 @@ def _evaluate_one(
     ece = calibration.compute_ece(probs, labels_arr)
 
     # Top-K rare-class recall
+    # Rank by P(KN) + P(TDE) — the correct metric for rare-class follow-up.
+    # Previously used max confidence across all classes which always ranked
+    # SNIa highest and gave recall=0 for rare classes.
     rare_idx = [label_map[rc] for rc in config.RARE_CLASSES if rc in label_map]
-    conf_scores = probs.max(axis=1)
-    unc_scores  = conf_scores / (1.0 + ent)
+
+    # Rare-class probability scores
+    rare_scores_conf = probs[:, rare_idx].sum(axis=1)
+    rare_scores_unc  = rare_scores_conf / (1.0 + ent)
+
     topk_recalls_conf = {}
     topk_recalls_unc  = {}
     for K in TOPK_EVAL:
         topk_recalls_conf[K] = float(
-            prioritization.compute_topk_recall(conf_scores, labels_arr, rare_idx, [K])[0]
+            prioritization.compute_topk_recall(rare_scores_conf, labels_arr, rare_idx, [K])[0]
         )
-        topk_recalls_unc[K]  = float(
-            prioritization.compute_topk_recall(unc_scores,  labels_arr, rare_idx, [K])[0]
+        topk_recalls_unc[K] = float(
+            prioritization.compute_topk_recall(rare_scores_unc, labels_arr, rare_idx, [K])[0]
         )
 
     if verbose:
@@ -238,21 +210,20 @@ def _evaluate_one(
         )
 
     row = {
-        "model":           model_name,
-        "truncation":      fraction,
-        "macro_f1":        macro_f1,
-        "pr_auc":          prauc,
-        "ece":             ece,
+        "model":            model_name,
+        "truncation":       fraction,
+        "macro_f1":         macro_f1,
+        "pr_auc":           prauc,
+        "ece":              ece,
         "per_class_recall": per_class_recall,
     }
     for K in TOPK_EVAL:
         row[f"recall_conf@{K}"] = topk_recalls_conf[K]
         row[f"recall_unc@{K}"]  = topk_recalls_unc[K]
 
-    # Store for calibration figure
-    row["_probs"]  = probs
-    row["_labels"] = labels_arr
-    row["_entropy"]= ent
+    row["_probs"]   = probs
+    row["_labels"]  = labels_arr
+    row["_entropy"] = ent
 
     return row
 
@@ -262,8 +233,8 @@ def _evaluate_one(
 # ---------------------------------------------------------------------------
 
 def evaluate_all(
-    fractions      : List[float]         = config.TRUNCATION_FRACTIONS,
-    models_to_eval : List[str]           = None,
+    fractions      : List[float]            = config.TRUNCATION_FRACTIONS,
+    models_to_eval : List[str]              = None,
     device         : Optional[torch.device] = None,
 ) -> pd.DataFrame:
     """
@@ -272,13 +243,12 @@ def evaluate_all(
     Parameters
     ----------
     fractions      : List of early-truncation fractions to evaluate.
-    models_to_eval : List of model names.  Defaults to all four.
-    device         : Compute device.  Auto-detected if None.
+    models_to_eval : List of model names. Defaults to all four.
+    device         : Compute device. Auto-detected if None.
 
     Returns
     -------
-    pd.DataFrame with one row per (model, fraction) combination and
-    columns for every metric.
+    pd.DataFrame with one row per (model, fraction) and columns for every metric.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -286,7 +256,6 @@ def evaluate_all(
     if models_to_eval is None:
         models_to_eval = ["xgboost", "transformer", "astromer", "moirai"]
 
-    # Load label map once (from full data)
     lc_full, meta = load_raw_data()
     lc_full       = handle_missing(lc_full)
     label_map, classes = build_label_map(meta)
@@ -294,8 +263,8 @@ def evaluate_all(
     print(f"[evaluate] {n_classes} classes, {len(fractions)} fractions, "
           f"{len(models_to_eval)} models → {n_classes * len(fractions) * len(models_to_eval)} runs")
 
-    rows     : List[Dict] = []
-    all_mc   : Dict[str, Dict] = {}   # for calibration plots
+    rows   : List[Dict] = []
+    all_mc : Dict[str, Dict] = {}
 
     for fraction in fractions:
         for model_name in models_to_eval:
@@ -303,14 +272,12 @@ def evaluate_all(
                 row = _evaluate_one(
                     model_name, fraction, label_map, classes, device, verbose=True
                 )
-                # Collect MC results for calibration / prioritization plots
-                # at the full-data fraction (most informative)
                 if fraction == 1.0:
                     all_mc[f"{model_name}"] = {
                         "mean_probs": row.pop("_probs"),
                         "labels":     row.pop("_labels"),
                         "entropy":    row.pop("_entropy"),
-                        "variance":   np.zeros(1),   # placeholder
+                        "variance":   np.zeros(1),
                     }
                 else:
                     row.pop("_probs",   None)
@@ -323,7 +290,6 @@ def evaluate_all(
 
     results_df = pd.DataFrame(rows)
 
-    # ---- Save results table ------------------------------------------------
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     table_path = os.path.join(config.RESULTS_DIR, "results_table.csv")
     results_df.drop(columns=["per_class_recall"], errors="ignore").to_csv(
@@ -331,7 +297,6 @@ def evaluate_all(
     )
     print(f"\n[evaluate] Results table saved → {table_path}")
 
-    # ---- Generate figures (using fraction=1.0 results) --------------------
     if all_mc:
         print("\n[evaluate] Generating calibration diagrams …")
         calibration.plot_all_models(all_mc)
