@@ -21,7 +21,7 @@ transformers>=4.40          # Chronos T5 encoder fallback
 huggingface_hub>=0.22       # model downloading
 
 # Astromer (Model 3) — installs as module 'ASTROMER' (all caps)
-astromer>=0.1.8             # pip install astromer
+# astromer>=0.1.8             # pip install astromer (will be isntalled manually for dependency issues)
 tensorboard>=2.14           # required by ASTROMER internals
 
 # Moirai (Model 4) — install uni2ts separately if desired:
