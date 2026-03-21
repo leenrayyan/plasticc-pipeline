@@ -10,16 +10,20 @@ the top of the ranked list.
 
 Two ranking strategies
 ----------------------
-(a) Confidence only:
-        score_i = max_c  p(c | x_i)
+(a) Rare-class probability score:
+        score_i = sum_c  p(c | x_i)   for c in {KN, TDE}
 
-(b) Uncertainty-weighted confidence:
-        score_i = max_c  p(c | x_i)  /  (1 + H(y | x_i))
+    This directly ranks alerts by how likely they are to be rare events.
+    This is the correct strategy for follow-up prioritization — we want
+    to find kilonovae and TDEs, not just "confident" predictions.
+
+(b) Uncertainty-weighted rare-class score:
+        score_i = rare_score_i / (1 + H(y | x_i))
 
     where H is the predictive entropy.  Dividing by entropy penalises
     high-confidence but also high-uncertainty predictions.
 
-For each strategy and each budget K ∈ {10, 20, …, 500}, we compute:
+For each strategy and each budget K in {10, 20, ..., 500}, we compute:
 
     Rare-class recall @ K = |{top-K} ∩ {true rare events}| / |{true rare events}|
 
@@ -58,16 +62,14 @@ def compute_topk_recall(
 
     Parameters
     ----------
-    scores             : 1-D array of ranking scores (higher → more likely rare).
+    scores             : 1-D array of ranking scores (higher = more likely rare).
     labels             : 1-D integer array of true class indices.
-    rare_label_indices : List of *class index* values (0-based) for rare classes.
+    rare_label_indices : List of 0-based class index values for rare classes.
     budget_range       : Sequence of K values to evaluate.
 
     Returns
     -------
-    recalls : np.ndarray  shape ``(len(budget_range),)``
-        Fraction of true rare events captured in the top-K ranked alerts,
-        for each K.  Returns NaN when there are no rare events in the batch.
+    recalls : np.ndarray shape (len(budget_range),)
     """
     n_total = len(labels)
     is_rare = np.isin(labels, rare_label_indices)
@@ -76,7 +78,6 @@ def compute_topk_recall(
     if n_rare == 0:
         return np.full(len(budget_range), np.nan, dtype=np.float32)
 
-    # Rank from highest score to lowest
     ranked_order = np.argsort(scores)[::-1]   # descending
 
     recalls = np.empty(len(budget_range), dtype=np.float32)
@@ -93,22 +94,35 @@ def compute_topk_recall(
 # Score builders
 # ---------------------------------------------------------------------------
 
-def _confidence_scores(mean_probs: np.ndarray) -> np.ndarray:
-    """Return max predicted probability per sample."""
+def _confidence_scores(
+    mean_probs         : np.ndarray,
+    rare_label_indices : List[int] = None,
+) -> np.ndarray:
+    """
+    Return rare-class probability score per sample.
+
+    Ranks alerts by sum of P(rare classes) — directly targeting what we
+    want to find. This is the correct strategy for rare-class follow-up.
+
+    Falls back to max class probability if no rare indices provided.
+    """
+    if rare_label_indices is not None and len(rare_label_indices) > 0:
+        return mean_probs[:, rare_label_indices].sum(axis=1)
     return mean_probs.max(axis=1)
 
 
 def _uncertainty_weighted_scores(
-    mean_probs : np.ndarray,
-    entropy    : np.ndarray,
+    mean_probs         : np.ndarray,
+    entropy            : np.ndarray,
+    rare_label_indices : List[int] = None,
 ) -> np.ndarray:
     """
-    Return confidence divided by (1 + entropy).
+    Return rare-class score divided by (1 + entropy).
 
-    Higher entropy → lower effective score, so uncertain predictions are
-    deprioritised.
+    Higher entropy = lower effective score, so uncertain predictions are
+    deprioritised even if they have high rare-class probability.
     """
-    confidence = mean_probs.max(axis=1)
+    confidence = _confidence_scores(mean_probs, rare_label_indices)
     return confidence / (1.0 + entropy)
 
 
@@ -127,17 +141,15 @@ def run_prioritization(
 
     Parameters
     ----------
-    results_dict : Mapping  model_name → mc_predict output
-                   (keys: ``mean_probs``, ``entropy``, ``labels``).
-    label_map    : Raw PLAsTiCC target → 0-based class index
-                   (from ``data_loader.build_label_map``).
+    results_dict : model_name -> mc_predict output
+                   (keys: mean_probs, entropy, labels).
+    label_map    : Raw PLAsTiCC target -> 0-based class index.
     budget_range : Sequence of K values.
     save_dir     : Directory to save the Top-K recall figure.
 
     Returns
     -------
-    recall_dict : Nested mapping
-                  ``model_name → strategy → np.ndarray(len(budget_range))``
+    recall_dict : model_name -> strategy -> np.ndarray(len(budget_range))
     """
     if save_dir is None:
         save_dir = config.FIG_DIR
@@ -160,15 +172,16 @@ def run_prioritization(
         entropy    = result["entropy"]
         labels     = result["labels"]
 
-        scores_conf = _confidence_scores(mean_probs)
-        scores_unc  = _uncertainty_weighted_scores(mean_probs, entropy)
+        # Rank by P(KN) + P(TDE) — the correct metric for rare-class follow-up
+        scores_conf = _confidence_scores(mean_probs, rare_label_indices)
+        scores_unc  = _uncertainty_weighted_scores(mean_probs, entropy, rare_label_indices)
 
         recalls_conf = compute_topk_recall(scores_conf, labels, rare_label_indices, budget_range)
         recalls_unc  = compute_topk_recall(scores_unc,  labels, rare_label_indices, budget_range)
 
         recall_dict[model_name] = {
-            "confidence":             recalls_conf,
-            "uncertainty_weighted":   recalls_unc,
+            "confidence":           recalls_conf,
+            "uncertainty_weighted": recalls_unc,
         }
 
         n_rare = np.isin(labels, rare_label_indices).sum()
@@ -191,26 +204,15 @@ def plot_topk_curves(
     budget_range : List[int]     = config.BUDGET_RANGE,
     save_dir     : Optional[str] = None,
 ) -> None:
-    """
-    Plot Top-K rare-class recall curves for all models and both strategies.
-
-    Produces two panels:
-    - Left:  confidence-only ranking.
-    - Right: uncertainty-weighted ranking.
-
-    Parameters
-    ----------
-    recall_dict  : Output of ``run_prioritization``.
-    budget_range : K values on the x-axis.
-    save_dir     : Directory for saving the figure.
-    """
+    """Plot Top-K rare-class recall curves for all models and both strategies."""
     if save_dir is None:
         save_dir = config.FIG_DIR
     os.makedirs(save_dir, exist_ok=True)
 
-    budgets   = np.array(budget_range)
+    budgets    = np.array(budget_range)
     strategies = ["confidence", "uncertainty_weighted"]
-    titles     = ["Strategy (a): Confidence only", "Strategy (b): Uncertainty-weighted"]
+    titles     = ["Strategy (a): Rare-class probability ranking",
+                  "Strategy (b): Uncertainty-weighted ranking"]
     colours    = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
@@ -246,22 +248,11 @@ def plot_topk_curves(
 
 
 def plot_accuracy_vs_truncation(
-    metric_table : "pd.DataFrame",  # noqa: F821
-    metric       : str   = "macro_f1",
+    metric_table : "pd.DataFrame",
+    metric       : str          = "macro_f1",
     save_dir     : Optional[str] = None,
 ) -> None:
-    """
-    Plot model accuracy (or any metric) as a function of observation fraction.
-
-    Parameters
-    ----------
-    metric_table : DataFrame with columns
-                   ``[model, truncation, <metric>, …]``.
-    metric       : Column name to plot on the y-axis.
-    save_dir     : Save directory.
-    """
-    import pandas as pd
-
+    """Plot model accuracy as a function of observation fraction."""
     if save_dir is None:
         save_dir = config.FIG_DIR
     os.makedirs(save_dir, exist_ok=True)
