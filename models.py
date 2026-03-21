@@ -329,10 +329,18 @@ class AstroClassifier(nn.Module):
 
         B, L = time.shape
 
+        # Convert flux to pseudo-magnitude scale for Astromer compatibility.
+        # Astromer was pretrained on MACHO magnitudes; our flux is z-score normalized.
+        # We clip to a small positive value before log to handle negative flux values.
+        flux_clipped = np.clip(flux, 1e-10, None)
+        magnitude    = -2.5 * np.log10(flux_clipped)
+        # Normalise to roughly magnitude scale (0-30 range) to match MACHO pretraining
+        magnitude    = np.clip(magnitude, -10, 30).astype(np.float32)
+
         # Astromer encoder expects a dict with TF tensors
         batch = {
             "times"  : tf.constant(time.reshape(B, L, 1)),
-            "input"  : tf.constant(flux.reshape(B, L, 1)),
+            "input"  : tf.constant(magnitude.reshape(B, L, 1)),
             "mask_in": tf.constant((1 - mask_np).reshape(B, L, 1)),  # 1=valid
         }
 
